@@ -63,6 +63,9 @@ The following diagram illustrates the reference architecture. It uses [Amazon AP
 |--------|------|------|----------|
 | **API Gateway + Lambda** | No VPC required, pay-per-request, native streaming support, lower operational overhead | Potential cold starts | Most use cases, cost-sensitive deployments |
 | **ALB + Fargate** | Lowest streaming latency, no cold starts | Higher cost, requires VPC | High-throughput, latency-sensitive workloads |
+| **Local + Cloudflare Tunnel** | Fastest path to a public domain (`api.mrdev.cyou`), per-user API keys + quotas | Requires an always-on Windows/Linux host | Personal/public proxy with custom domain |
+
+For the local public proxy (multi-key auth, quotas, Cloudflare Tunnel), see [Public Proxy Guide](./docs/Public_Proxy.md).
 
 You can also use Lambda Function URL as an alternative, see [example](https://github.com/awslabs/aws-lambda-web-adapter/tree/main/examples/fastapi-response-streaming)
 

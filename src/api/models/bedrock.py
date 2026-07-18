@@ -1,7 +1,10 @@
 import base64
+import contextvars
 import json
 import logging
+import os
 import re
+import threading
 import time
 from abc import ABC
 from typing import AsyncIterable, Iterable, Literal
@@ -15,6 +18,7 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
+from api.safe_errors import raise_upstream_http, status_and_detail_for_upstream
 from api.schema import (
     AssistantMessage,
     ChatRequest,
@@ -42,8 +46,12 @@ from api.schema import (
     Usage,
     UserMessage,
 )
+from api.model_alias import geo_failover_model_ids, preferred_regions_for_model
 from api.setting import (
     AWS_REGION,
+    BEDROCK_FAILOVER_MAX_TRIES,
+    BEDROCK_FAILOVER_REGIONS,
+    BEDROCK_RUNTIME_MAX_ATTEMPTS,
     DEBUG,
     DEFAULT_MODEL,
     ENABLE_CROSS_REGION_INFERENCE,
@@ -54,14 +62,24 @@ from api.setting import (
 logger = logging.getLogger(__name__)
 
 config = Config(
-            connect_timeout=60,      # Connection timeout: 60 seconds
-            read_timeout=900,        # Read timeout: 15 minutes (suitable for long streaming responses)
+            # Short connect so dead regions fail fast during failover (stream TTFT).
+            connect_timeout=8,
+            read_timeout=900,  # long streams still need a high read timeout
             retries={
-                'max_attempts': 8,   # Maximum retry attempts
-                'mode': 'adaptive'   # Adaptive retry mode
+                # Keep low: gateway handles Throttling via multi-region / multi-cred failover.
+                "max_attempts": BEDROCK_RUNTIME_MAX_ATTEMPTS,
+                "mode": "standard",
             },
-            max_pool_connections=50  # Maximum connection pool size
+            max_pool_connections=50,
         )
+
+# Short timeouts for model listing only — never let AWS discovery hang the whole gateway.
+_list_config = Config(
+    connect_timeout=5,
+    read_timeout=20,
+    retries={"max_attempts": 1, "mode": "standard"},
+    max_pool_connections=10,
+)
 
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
@@ -71,8 +89,203 @@ bedrock_runtime = boto3.client(
 bedrock_client = boto3.client(
     service_name="bedrock",
     region_name=AWS_REGION,
-    config=config,
+    config=_list_config,
 )
+
+# Per-credential + region Bedrock Runtime clients (AWS Access Key pool).
+# Cache key: "cred_id|region" or "env|region"
+_runtime_client_cache: dict[str, object] = {}
+_runtime_client_lock = threading.Lock()
+_active_aws_cred_id: contextvars.ContextVar[str] = contextvars.ContextVar("active_aws_cred_id", default="")
+_active_aws_cred_name: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "active_aws_cred_name", default=""
+)
+
+
+def get_active_aws_credential() -> tuple[str, str]:
+    """Return (cred_id, name) used by the current Bedrock invoke, if any."""
+    return _active_aws_cred_id.get() or "", _active_aws_cred_name.get() or ""
+
+
+def invalidate_aws_credential_clients(cred_id: str | None = None) -> None:
+    """Drop cached boto3 clients after admin create/update/delete."""
+    with _runtime_client_lock:
+        if cred_id is None:
+            _runtime_client_cache.clear()
+            return
+        prefix = f"{cred_id}|"
+        for key in list(_runtime_client_cache):
+            if key == cred_id or key.startswith(prefix):
+                _runtime_client_cache.pop(key, None)
+
+
+def get_bedrock_runtime_client(cred=None, region: str | None = None):
+    """Return a bedrock-runtime client for an AwsCredentialRecord (+ optional region)."""
+    region_name = (region or (cred.region if cred else None) or AWS_REGION).strip() or AWS_REGION
+    if cred is None and region_name == AWS_REGION:
+        return bedrock_runtime
+    cache_key = f"{cred.cred_id if cred else 'env'}|{region_name}"
+    with _runtime_client_lock:
+        cached = _runtime_client_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        kwargs = {
+            "service_name": "bedrock-runtime",
+            "region_name": region_name,
+            "config": config,
+        }
+        if cred is not None:
+            kwargs["aws_access_key_id"] = cred.access_key_id
+            kwargs["aws_secret_access_key"] = cred.secret_access_key
+            if cred.session_token:
+                kwargs["aws_session_token"] = cred.session_token
+        client = boto3.client(**kwargs)
+        _runtime_client_cache[cache_key] = client
+        return client
+
+
+def _is_quota_or_throttle_error(exc: BaseException) -> bool:
+    """RPM / daily token / quota — worth trying other regions or creds."""
+    name = type(exc).__name__
+    if name in ("ThrottlingException", "ServiceQuotaExceededException"):
+        return True
+    msg = str(exc).lower()
+    return (
+        "throttl" in msg
+        or "too many tokens" in msg
+        or "service quota" in msg
+        or "quota exceeded" in msg
+    )
+
+
+def _is_access_denied_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if name == "AccessDeniedException" or "AccessDeniedException" in name:
+        return True
+    msg = str(exc).lower()
+    return "access denied" in msg or "not authorized" in msg
+
+
+def _is_failover_error(exc: BaseException) -> bool:
+    return _is_quota_or_throttle_error(exc) or _is_access_denied_error(exc)
+
+
+def _is_model_route_validation_error(exc: BaseException) -> bool:
+    """ValidationException that usually means wrong region / geo profile — safe to retry."""
+    name = type(exc).__name__
+    if name != "ValidationException" and "ValidationException" not in name:
+        return False
+    msg = str(exc).lower()
+    needles = (
+        "model identifier",
+        "model id",
+        "inference profile",
+        "on-demand throughput",
+        "isn't supported",
+        "is not supported",
+        "not found",
+        "does not exist",
+        "invalid model",
+        "access to the model",
+    )
+    return any(n in msg for n in needles)
+
+
+def _regions_for_credential(cred) -> list[str]:
+    """Home region first, then configured failover endpoints."""
+    home = ((cred.region if cred else None) or AWS_REGION).strip() or AWS_REGION
+    out: list[str] = []
+    for r in (home, *BEDROCK_FAILOVER_REGIONS):
+        rr = (r or "").strip()
+        if rr and rr not in out:
+            out.append(rr)
+    return out
+
+
+def _cred_key(cred) -> str:
+    return cred.cred_id if cred is not None else "env"
+
+
+# Last successful (cred_key, region, model_id) per public/request model — try first next time.
+_sticky_lock = threading.Lock()
+_sticky_route: dict[str, tuple[str, str, str]] = {}
+
+
+def _remember_sticky(model: str, cred, region: str, model_id: str) -> None:
+    with _sticky_lock:
+        _sticky_route[model] = (_cred_key(cred), region, model_id)
+
+
+def _iter_runtime_clients_for_model(model: str):
+    """Yield (cred_or_None, client, model_id, region) for failover.
+
+    Order (optimized for TTFT when some AWS keys lack model access):
+      0) Sticky last-good route for this model
+      1) Each AWS pool key @ home region (rotate creds before burning regions)
+      2) Other failover regions × creds with the original modelId
+      3) Alternate CRI geos (eu./global./…) on preferred endpoints
+
+    When the admin pool has a matching AWS key, do **not** fall back to the
+    process env/default credentials — that was sending Fable 5 to the old key.
+    Env fallback is only used when no pool key matches the model.
+    """
+    creds: list = []
+    try:
+        from api.db import auth_db
+
+        creds = list(auth_db.select_aws_credentials_for_model(model) or [])
+    except Exception as exc:  # noqa: BLE001 — never block chat on DB issues
+        logger.warning("AWS credential pool unavailable: %s", exc)
+    if not creds:
+        logger.info("No AWS pool key for model %s — using env/default credentials", model)
+        creds = [None]
+
+    model_ids = geo_failover_model_ids(model) or [model]
+    primary = model_ids[0]
+    cred_by_key = {_cred_key(c): c for c in creds}
+    seen: set[tuple[str, str, str]] = set()
+    yielded = 0
+
+    def emit(cred, region: str, mid: str):
+        nonlocal yielded
+        key = (_cred_key(cred), region, mid)
+        if key in seen or yielded >= BEDROCK_FAILOVER_MAX_TRIES:
+            return None
+        seen.add(key)
+        yielded += 1
+        return cred, get_bedrock_runtime_client(cred, region), mid, region
+
+    with _sticky_lock:
+        sticky = _sticky_route.get(model)
+    if sticky:
+        ck, region, mid = sticky
+        if ck in cred_by_key:
+            item = emit(cred_by_key[ck], region, mid)
+            if item is not None:
+                yield item
+
+    # Phase A1: rotate AWS keys on home region first (AccessDenied → next key quickly).
+    for cred in creds:
+        home = _regions_for_credential(cred)[0]
+        item = emit(cred, home, primary)
+        if item is not None:
+            yield item
+
+    # Phase A2: remaining regional endpoints × keys (helps RPM / regional throttle).
+    for cred in creds:
+        for region in _regions_for_credential(cred)[1:]:
+            item = emit(cred, region, primary)
+            if item is not None:
+                yield item
+
+    # Phase B: alternate CRI geos (often separate daily quotas) on preferred endpoints.
+    for mid in model_ids[1:]:
+        for cred in creds:
+            regions = preferred_regions_for_model(mid, _regions_for_credential(cred))
+            for region in regions:
+                item = emit(cred, region, mid)
+                if item is not None:
+                    yield item
 
 SUPPORTED_BEDROCK_EMBEDDING_MODELS = {
     "cohere.embed-multilingual-v3": "Cohere Embed Multilingual",
@@ -200,40 +413,162 @@ def list_bedrock_models() -> dict:
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
 
-    if not model_list:
-        # In case stack not updated.
-        model_list[DEFAULT_MODEL] = {"modalities": ["TEXT", "IMAGE"]}
-
-    return model_list
+    return _merge_fallback_models(model_list)
 
 
-# Initialize the model list.
-bedrock_model_list = list_bedrock_models()
+# Lazy-init: avoid blocking process import/startup on a full AWS Bedrock listing.
+bedrock_model_list: dict = {}
+_bedrock_model_list_fetched_at = 0.0
+_MODEL_LIST_TTL_SECONDS = int(os.environ.get("MODEL_LIST_TTL_SECONDS", "300"))
+_model_list_lock = threading.Lock()
+_model_refresh_lock = threading.Lock()
+_model_refresh_thread: threading.Thread | None = None
+
+
+# Shown in admin/CDK pickers when Bedrock ListModels is unreachable (VPN/DNS/etc.).
+# Keep in sync with api.model_alias.CURATED_INTERNAL / PUBLIC_CATALOG.
+_FALLBACK_CHAT_MODELS = (
+    "us.anthropic.claude-fable-5",
+    "global.anthropic.claude-fable-5",
+    "us.anthropic.claude-opus-4-8",
+    "global.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-opus-4-7",
+    "global.anthropic.claude-opus-4-7",
+    "us.anthropic.claude-opus-4-6-v1",
+    "global.anthropic.claude-opus-4-6-v1",
+    "us.anthropic.claude-sonnet-5",
+    "global.anthropic.claude-sonnet-5",
+    "us.anthropic.claude-sonnet-4-6",
+    "global.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "us.anthropic.claude-opus-4-1-20250805-v1:0",
+    "us.anthropic.claude-opus-4-20250514-v1:0",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "anthropic.claude-3-opus-20240229-v1:0",
+    "anthropic.claude-3-sonnet-20240229-v1:0",
+    "anthropic.claude-3-haiku-20240307-v1:0",
+    DEFAULT_MODEL,
+)
+
+
+def _default_model_map() -> dict:
+    return {m: {"modalities": ["TEXT", "IMAGE"]} for m in _FALLBACK_CHAT_MODELS if m}
+
+
+def _merge_fallback_models(model_list: dict) -> dict:
+    """Always expose curated popular IDs even if AWS listing is partial/failed."""
+    out = dict(model_list or {})
+    for mid, meta in _default_model_map().items():
+        out.setdefault(mid, meta)
+    return out
+
+
+def _looks_like_bedrock_chat_model(model_id: str) -> bool:
+    m = (model_id or "").lower()
+    if not m:
+        return False
+    if m.startswith(("us.", "eu.", "apac.", "global.", "jp.", "au.", "ca.", "us-gov.")):
+        return True
+    needles = (
+        "anthropic.claude",
+        "amazon.nova",
+        "amazon.titan",
+        "meta.llama",
+        "mistral.",
+        "cohere.",
+        "application-inference-profile",
+    )
+    return any(n in m for n in needles)
+
+
+def _schedule_model_list_refresh() -> None:
+    """Kick a background AWS list refresh without blocking callers."""
+    global _model_refresh_thread
+    # Do not take _model_list_lock here — callers may already hold it.
+    alive = _model_refresh_thread is not None and _model_refresh_thread.is_alive()
+    if alive:
+        return
+
+    def _run() -> None:
+        try:
+            get_bedrock_model_list(force_refresh=True, allow_network=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Background model list refresh failed: %s", exc)
+
+    t = threading.Thread(target=_run, name="bedrock-model-list", daemon=True)
+    _model_refresh_thread = t
+    t.start()
+
+
+def get_bedrock_model_list(force_refresh: bool = False, *, allow_network: bool = True) -> dict:
+    """Return cached Bedrock model map.
+
+    Important: never hold the cache lock while calling AWS. Hot paths (chat validate)
+    must use allow_network=False so a slow/unreachable Bedrock API cannot freeze the site.
+    """
+    global bedrock_model_list, _bedrock_model_list_fetched_at
+    now = time.time()
+    need_bg_refresh = False
+    with _model_list_lock:
+        cached = dict(bedrock_model_list) if bedrock_model_list else {}
+        fetched_at = _bedrock_model_list_fetched_at
+        stale = (now - fetched_at) >= _MODEL_LIST_TTL_SECONDS
+        if cached and not force_refresh and not stale:
+            return cached
+        if not allow_network:
+            need_bg_refresh = True
+            result = cached or _default_model_map()
+        else:
+            result = None
+
+    if need_bg_refresh:
+        _schedule_model_list_refresh()
+        return result  # type: ignore[return-value]
+
+    # Only one network refresh at a time; others get stale/default immediately.
+    if not _model_refresh_lock.acquire(blocking=False):
+        return cached or _default_model_map()
+    try:
+        fresh = _merge_fallback_models(list_bedrock_models())
+        with _model_list_lock:
+            bedrock_model_list = fresh
+            _bedrock_model_list_fetched_at = time.time()
+            return dict(bedrock_model_list)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Unable to refresh model list: %s", exc)
+        with _model_list_lock:
+            if bedrock_model_list:
+                return _merge_fallback_models(bedrock_model_list)
+        return _merge_fallback_models(cached)
+    finally:
+        _model_refresh_lock.release()
 
 
 class BedrockModel(BaseChatModel):
-    def list_models(self) -> list[str]:
-        """Always refresh the latest model list"""
-        global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
-        return list(bedrock_model_list.keys())
+    def list_models(self, force_refresh: bool = False) -> list[str]:
+        """Return model IDs from a short-lived cache (avoids blocking AWS on every call)."""
+        return list(get_bedrock_model_list(force_refresh=force_refresh, allow_network=True).keys())
 
     def validate(self, chat_request: ChatRequest):
-        """Perform basic validation on requests"""
+        """Perform basic validation on requests — never blocks on AWS network I/O."""
         error = ""
-        # check if model is supported
-        if chat_request.model not in bedrock_model_list.keys():
-            # Provide helpful error for application profiles
-            if "application-inference-profile" in chat_request.model:
-                error = (
-                    f"Application profile {chat_request.model} not found. "
-                    f"Available profiles can be listed via GET /models API. "
-                    f"Ensure ENABLE_APPLICATION_INFERENCE_PROFILES=true and "
-                    f"the profile exists in your AWS account."
-                )
+        # Cache-only on the hot path. Background refresh fills gaps.
+        models = get_bedrock_model_list(allow_network=False)
+        if chat_request.model not in models:
+            if _looks_like_bedrock_chat_model(chat_request.model):
+                # Let Bedrock accept/reject; avoid hanging the gateway on list APIs.
+                _schedule_model_list_refresh()
+            elif "application-inference-profile" in chat_request.model:
+                error = "Unsupported model. Use GET /models for available IDs."
             else:
-                error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
-            logger.error("Unsupported model: %s", chat_request.model)
+                error = "Unsupported model. Use GET /models for available IDs."
+                logger.error("Unsupported model: %s", chat_request.model)
 
         # Validate profile has resolvable underlying model
         if not error and chat_request.model in profile_metadata:
@@ -350,25 +685,96 @@ class BedrockModel(BaseChatModel):
         if DEBUG:
             logger.info("Bedrock request: " + json.dumps(str(args)))
 
-        try:
-            if stream:
-                # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(
-                    bedrock_runtime.converse_stream, **args
+        last_error: Exception | None = None
+        tried = 0
+        # Permanent AccessDenied on a key: skip remaining regions for that key this request.
+        skip_creds: set[str] = set()
+        _active_aws_cred_id.set("")
+        _active_aws_cred_name.set("")
+        for cred, client, model_id, region in _iter_runtime_clients_for_model(chat_request.model):
+            ck = _cred_key(cred)
+            if ck in skip_creds:
+                continue
+            tried += 1
+            invoke_args = {**args, "modelId": model_id}
+            try:
+                if stream:
+                    response = await run_in_threadpool(client.converse_stream, **invoke_args)
+                else:
+                    response = await run_in_threadpool(client.converse, **invoke_args)
+                _remember_sticky(chat_request.model, cred, region, model_id)
+                if cred is not None:
+                    _active_aws_cred_id.set(cred.cred_id)
+                    _active_aws_cred_name.set(cred.name)
+                    try:
+                        from api.db import auth_db
+
+                        auth_db.touch_aws_credential(cred.cred_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.info(
+                        "Bedrock %s via AWS cred %s (%s) region=%s%s",
+                        model_id,
+                        cred.cred_id,
+                        cred.name,
+                        region,
+                        " [default]" if cred.is_default else "",
+                    )
+                else:
+                    _active_aws_cred_id.set("")
+                    _active_aws_cred_name.set("env")
+                    logger.info("Bedrock %s via env credentials region=%s", model_id, region)
+                return response
+            except Exception as e:
+                last_error = e
+                err_name = type(e).__name__
+                if err_name == "ValidationException" or "ValidationException" in err_name:
+                    if _is_model_route_validation_error(e) and tried < BEDROCK_FAILOVER_MAX_TRIES:
+                        logger.warning(
+                            "Bedrock validation failover model=%s region=%s via %s: %s",
+                            model_id,
+                            region,
+                            ck,
+                            str(e),
+                        )
+                        continue
+                    logger.error(
+                        "Bedrock validation error for model %s: %s", model_id, str(e)
+                    )
+                    raise_upstream_http(e, log_label="bedrock-validate")
+                if _is_failover_error(e) and tried < BEDROCK_FAILOVER_MAX_TRIES:
+                    # Model not enabled on this AWS key → don't walk every region on it.
+                    if _is_access_denied_error(e) and not _is_quota_or_throttle_error(e):
+                        skip_creds.add(ck)
+                        logger.warning(
+                            "Bedrock AccessDenied skip cred=%s model=%s region=%s: %s",
+                            ck,
+                            model_id,
+                            region,
+                            str(e),
+                        )
+                    else:
+                        logger.warning(
+                            "Bedrock failover model=%s region=%s via %s: %s",
+                            model_id,
+                            region,
+                            ck,
+                            str(e),
+                        )
+                    continue
+                if err_name == "ThrottlingException" or "ThrottlingException" in err_name:
+                    raise_upstream_http(e, log_label="bedrock-throttle")
+                logger.error(
+                    "Bedrock invocation failed for model %s region=%s: %s",
+                    model_id,
+                    region,
+                    str(e),
                 )
-            else:
-                # Run the blocking boto3 call in a thread pool
-                response = await run_in_threadpool(bedrock_runtime.converse, **args)
-        except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Bedrock validation error for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
-            logger.warning("Bedrock throttling for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=429, detail=str(e))
-        except Exception as e:
-            logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=500, detail=str(e))
-        return response
+                raise_upstream_http(e, log_label="bedrock-invoke")
+
+        if last_error is not None:
+            raise_upstream_http(last_error, log_label="bedrock-exhausted")
+        raise HTTPException(status_code=500, detail="Upstream error. Try again later.")
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Default implementation for Chat API."""
@@ -409,9 +815,19 @@ class BedrockModel(BaseChatModel):
         return chat_response
 
     async def _async_iterate(self, stream):
-        """Helper method to convert sync iterator to async iterator"""
-        for chunk in stream:
-            await run_in_threadpool(lambda: chunk)
+        """Convert sync Bedrock stream iterator without a no-op threadpool hop per chunk."""
+
+        def _next_or_done(it):
+            try:
+                return next(it), True
+            except StopIteration:
+                return None, False
+
+        it = iter(stream)
+        while True:
+            chunk, ok = await run_in_threadpool(_next_or_done, it)
+            if not ok:
+                break
             yield chunk
 
     async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
@@ -459,7 +875,9 @@ class BedrockModel(BaseChatModel):
             self.think_emitted = False  # Cleanup
         except Exception as e:
             logger.error("Stream error for model %s: %s", chat_request.model, str(e))
-            error_event = Error(error=ErrorMessage(message=str(e)))
+            # Never send str(e) / str(HTTPException) — those embed Bedrock URLs.
+            _code, safe = status_and_detail_for_upstream(e)
+            error_event = Error(error=ErrorMessage(message=safe or "Upstream error. Try again later."))
             yield self.stream_response_to_bytes(error_event)
 
     def _parse_system_prompts(self, chat_request: ChatRequest) -> list[dict[str, str]]:
@@ -482,9 +900,21 @@ class BedrockModel(BaseChatModel):
         for message in chat_request.messages:
             if message.role not in ("system", "developer"):
                 continue
-            if not isinstance(message.content, str):
-                raise TypeError(f"System message content must be a string, got {type(message.content).__name__}")
-            system_prompts.append({"text": message.content})
+            if isinstance(message.content, str):
+                system_prompts.append({"text": message.content})
+            elif isinstance(message.content, list):
+                # Claude Code / OpenAI multimodal style: content is a list of blocks.
+                for part in message.content:
+                    text = getattr(part, "text", None)
+                    if text is None and isinstance(part, dict):
+                        text = part.get("text")
+                    if text:
+                        system_prompts.append({"text": text})
+            else:
+                raise TypeError(
+                    f"System message content must be a string or list of text blocks, "
+                    f"got {type(message.content).__name__}"
+                )
 
         if not system_prompts:
             return system_prompts
@@ -966,6 +1396,7 @@ class BedrockModel(BaseChatModel):
             # cached_tokens represents tokens read from cache (cache hits)
             prompt_tokens_details = PromptTokensDetails(
                 cached_tokens=cache_read_tokens,
+                cache_write_tokens=cache_creation_tokens,
                 audio_tokens=0,
             )
 
@@ -1116,6 +1547,7 @@ class BedrockModel(BaseChatModel):
                 if cache_read_tokens > 0 or cache_creation_tokens > 0:
                     prompt_tokens_details = PromptTokensDetails(
                         cached_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_creation_tokens,
                         audio_tokens=0,
                     )
 
@@ -1207,7 +1639,7 @@ class BedrockModel(BaseChatModel):
                 if not self.is_supported_modality(model_id, modality="IMAGE"):
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Multimodal message is currently not supported by {model_id}",
+                        detail="Multimodal message is currently not supported for this model",
                     )
                 image_data, content_type = self._parse_image(part.image_url.url)
                 content_parts.append(
@@ -1225,7 +1657,7 @@ class BedrockModel(BaseChatModel):
 
     @staticmethod
     def is_supported_modality(model_id: str, modality: str = "IMAGE") -> bool:
-        model = bedrock_model_list.get(model_id, {})
+        model = get_bedrock_model_list().get(model_id, {})
         modalities = model.get("modalities", [])
         if modality in modalities:
             return True
@@ -1290,22 +1722,57 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
         if DEBUG:
             logger.info("Invoke Bedrock Model: " + model_id)
             logger.info("Bedrock request body: " + body)
-        try:
-            return bedrock_runtime.invoke_model(
-                body=body,
-                modelId=model_id,
-                accept=self.accept,
-                contentType=self.content_type,
-            )
-        except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Validation Error: " + str(e))
-            raise HTTPException(status_code=400, detail=str(e))
-        except bedrock_runtime.exceptions.ThrottlingException as e:
-            logger.error("Throttling Error: " + str(e))
-            raise HTTPException(status_code=429, detail=str(e))
-        except Exception as e:
-            logger.error(e)
-            raise HTTPException(status_code=500, detail=str(e))
+        last_error: Exception | None = None
+        tried = 0
+        for cred, client, mid, region in _iter_runtime_clients_for_model(model_id):
+            tried += 1
+            try:
+                result = client.invoke_model(
+                    body=body,
+                    modelId=mid,
+                    accept=self.accept,
+                    contentType=self.content_type,
+                )
+                if cred is not None:
+                    try:
+                        from api.db import auth_db
+
+                        auth_db.touch_aws_credential(cred.cred_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                logger.info("Embeddings %s via %s region=%s", mid, cred.cred_id if cred else "env", region)
+                return result
+            except Exception as e:
+                last_error = e
+                err_name = type(e).__name__
+                if err_name == "ValidationException" or "ValidationException" in err_name:
+                    if _is_model_route_validation_error(e) and tried < BEDROCK_FAILOVER_MAX_TRIES:
+                        logger.warning(
+                            "Embeddings validation failover %s region=%s via %s: %s",
+                            mid,
+                            region,
+                            cred.cred_id if cred else "env",
+                            str(e),
+                        )
+                        continue
+                    logger.error("Validation Error: " + str(e))
+                    raise_upstream_http(e, log_label="embeddings-validate")
+                if _is_failover_error(e) and tried < BEDROCK_FAILOVER_MAX_TRIES:
+                    logger.warning(
+                        "Embeddings failover for %s region=%s via %s: %s",
+                        mid,
+                        region,
+                        cred.cred_id if cred else "env",
+                        str(e),
+                    )
+                    continue
+                if err_name == "ThrottlingException" or "ThrottlingException" in err_name:
+                    raise_upstream_http(e, log_label="embeddings-throttle")
+                logger.error(e)
+                raise_upstream_http(e, log_label="embeddings-invoke")
+        if last_error is not None:
+            raise_upstream_http(last_error, log_label="embeddings-exhausted")
+        raise HTTPException(status_code=500, detail="Upstream error. Try again later.")
 
     def _create_response(
         self,

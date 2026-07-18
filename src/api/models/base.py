@@ -49,7 +49,9 @@ class BaseChatModel(ABC):
     @staticmethod
     def stream_response_to_bytes(response: ChatStreamResponse | Error | None = None) -> bytes:
         if isinstance(response, Error):
-            logger.error("Stream error: %s", response.error.message if response.error else "Unknown error")
+            # Client already got a sanitized message; do not re-log provider URLs.
+            logger.error("Stream error (client message): %s",
+                         (response.error.message if response.error else "Unknown error")[:120])
             data = response.model_dump_json()
         elif isinstance(response, ChatStreamResponse):
             # to populate other fields when using exclude_unset=True

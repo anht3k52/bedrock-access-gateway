@@ -121,6 +121,11 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
+deploy/.env.local
+deploy/cloudflared-config.yml
+.bedrock-access-gateway/
+*.db
 .venv
 env/
 venv/

@@ -1,0 +1,21 @@
+# Example Cloudflare Tunnel config for api.mrdev.cyou
+# 1. cloudflared tunnel login
+# 2. cloudflared tunnel create bedrock-proxy
+# 3. cloudflared tunnel route dns bedrock-proxy api.mrdev.cyou
+# 4. Copy this file to deploy/cloudflared-config.yml and fill tunnel UUID + credentials file path
+# 5. cloudflared tunnel --config deploy/cloudflared-config.yml run
+#
+# Or install as a Windows service / Task Scheduler via deploy/install-windows-tasks.ps1
+
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: C:\Users\admin\.cloudflared\REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: api.mrdev.cyou
+    service: http://127.0.0.1:8000
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      # Keep streaming/SSE alive
+      http2Origin: false
+  - service: http_status:404

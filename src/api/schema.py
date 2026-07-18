@@ -10,7 +10,7 @@ class Model(BaseModel):
     id: str
     created: int = Field(default_factory=lambda: int(time.time()))
     object: str | None = "model"
-    owned_by: str | None = "bedrock"
+    owned_by: str | None = "system"
 
 
 class Models(BaseModel):
@@ -53,7 +53,7 @@ class ToolContent(BaseModel):
 class SystemMessage(BaseModel):
     name: str | None = None
     role: Literal["system"] = "system"
-    content: str
+    content: str | list[TextContent]
 
 
 class UserMessage(BaseModel):
@@ -78,7 +78,7 @@ class ToolMessage(BaseModel):
 class DeveloperMessage(BaseModel):
     name: str | None = None
     role: Literal["developer"] = "developer"
-    content: str
+    content: str | list[TextContent]
 
 
 class Function(BaseModel):
@@ -119,6 +119,7 @@ class ChatRequest(BaseModel):
 class PromptTokensDetails(BaseModel):
     """Details about prompt tokens usage, following OpenAI API format."""
     cached_tokens: int = 0
+    cache_write_tokens: int = 0
     audio_tokens: int = 0
 
 

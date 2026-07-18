@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>MRDEV Gateway</title>
+  <!--MRDEV_CFG-->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("mrdev_theme");
+        document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "light");
+      }
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;700;800&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/static/styles.css?v=52" />
+  <link rel="stylesheet" href="/static/docs.css?v=52" />
+  <style>
+    /* Emergency visible fallback if external CSS fails */
+    #app:empty::before {
+      content: "正在加载界面… 若太久请强制刷新 (Ctrl+F5)。";
+      display: block;
+      padding: 2rem;
+      color: #9fe6c8;
+      font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    #boot-error {
+      display: none;
+      margin: 1rem;
+      padding: 1rem 1.2rem;
+      border-radius: 12px;
+      background: #3f1d1d;
+      color: #fecaca;
+      border: 1px solid #7f1d1d;
+      font-family: system-ui, sans-serif;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <span class="logo">MG</span>
+      <span>
+        <strong>MRDEV</strong>
+        <small>Gateway</small>
+      </span>
+    </a>
+    <nav class="nav" id="main-nav"></nav>
+  </header>
+  <div id="boot-error"></div>
+  <main id="app"></main>
+  <script>
+    // Redirect wrong paths like /v/docs -> /#/docs
+    (function () {
+      var p = location.pathname.replace(/\/+$/, "");
+      var cfg = window.__MRDEV_CFG__ || {};
+      var adminSlug = cfg.adminUiSlug || "";
+      if (p && p !== "" && p !== "/") {
+        var map = {
+          "/docs": "#/docs",
+          "/v/docs": "#/docs",
+          "/admin": "#/",
+          "/admin/login": "#/",
+          "/user": "#/user",
+          "/chat": "#/chat",
+          "/usage": "#/usage"
+        };
+        // Old leaked slug → home (do not advertise admin)
+        if (p === "/mrdevdeptraivodich" || p.indexOf("/mrdevdeptraivodich/") === 0) {
+          location.replace("/#/");
+          return;
+        }
+        if (adminSlug && (p === "/" + adminSlug || p.indexOf("/" + adminSlug + "/") === 0)) {
+          location.replace("/#/" + adminSlug + (p.length > adminSlug.length + 1 ? p.slice(adminSlug.length + 1) : ""));
+          return;
+        }
+        if (map[p]) {
+          location.replace("/" + map[p]);
+          return;
+        }
+        if (!p.startsWith("/api") && !p.startsWith("/admin") && !p.startsWith("/static") && p !== "/health") {
+          location.replace("/#/");
+        }
+      }
+    })();
+    window.__mrdevBootError = function (err) {
+      var el = document.getElementById("boot-error");
+      if (!el) return;
+      el.style.display = "block";
+      el.textContent = "界面加载失败: " + (err && err.message ? err.message : String(err));
+    };
+  </script>
+  <script src="/static/i18n.js?v=52" onerror="window.__mrdevBootError(new Error('Failed to load i18n.js'))"></script>
+  <script src="/static/docs.js?v=52" onerror="window.__mrdevBootError(new Error('Failed to load docs.js'))"></script>
+  <script src="/static/admin-docs.js?v=52" onerror="window.__mrdevBootError(new Error('Failed to load admin-docs.js'))"></script>
+  <script src="/static/app.js?v=52" onerror="window.__mrdevBootError(new Error('Failed to load app.js'))"></script>
+  <script>
+    setTimeout(function () {
+      var app = document.getElementById("app");
+      if (app && !app.innerHTML.trim()) {
+        app.innerHTML =
+          '<section style="padding:2rem;max-width:720px;margin:0 auto;color:#e8fff6;font-family:system-ui">' +
+          "<h1>MRDEV Gateway</h1>" +
+          "<p>JS UI did not start. Try Ctrl+F5 or open:</p>" +
+          '<p><a style="color:#5eead4" href="/#/">/#/</a> · ' +
+          '<a style="color:#5eead4" href="/#/docs">/#/docs</a> · ' +
+          '<a style="color:#5eead4" href="/#/user">/#/user</a></p>' +
+          "<p>Docs URL: <code>https://api.mrdev.cyou/#/docs</code> (with #)</p>" +
+          "</section>";
+      }
+    }, 1500);
+  </script>
+</body>
+</html>
